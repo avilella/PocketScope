@@ -7,3 +7,6 @@ dist/
 *.npy
 !examples/*.npy
 .DS_Store
+datasets/.cache/
+datasets/nanobody_bench/
+datasets/nanobody_holdout/
