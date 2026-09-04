@@ -91,6 +91,23 @@ for hit in ix.search(query, top_k=10):
     print(hit["accession"], hit["score"])
 ```
 
+## EpitopeScope
+
+`epitopescope.py` is a separate tool built on this representation. Given a folder of antigen
+PDB files it ranks the surface epitopes worth targeting with in-silico designed nanobodies, so
+that the panel has minimal cross-talk between antigens and each epitope sits in a fragment an
+E. coli PURE IVTT reaction can actually make and fold. See
+[README.epitopescope.md](README.epitopescope.md).
+
+```bash
+python datasets/build_panels.py                       # 10 / 48 / 96 antigen panels
+python epitopescope.py -d datasets/panel96 --embed esm2
+python benchmark_epitopescope.py --embed esm2 --device cpu   # retrospective validation
+```
+
+Each run writes one `<antigen>.<tag>.csv` per input plus an `epitopescope.<tag>.yaml`
+dictionary describing every column and what high and low values mean.
+
 ## Repository contents
 
 | file | what it does |
@@ -101,6 +118,11 @@ for hit in ix.search(query, top_k=10):
 | `pocketscope/index.py` | holds the index and runs the MaxSim search |
 | `pocketscope/cli.py` | the `pocketscope` command |
 | `examples/quickstart.py` | scores two pockets from the index |
+| `epitopescope.py` | epitope ranking for orthogonal, PURE-expressible nanobody design |
+| `benchmark_epitopescope.py` | retrospective validation against solved nanobody complexes |
+| `datasets/build_panels.py` | builds the 10 / 48 / 96 antigen benchmark panels |
+| `datasets/build_benchmark.py` | builds the nanobody-complex validation sets |
+| `envs/` | conda and venv environments for `epitopescope.py` |
 
 Benchmarks and figure sources live in the Zenodo record rather than here, to keep this
 repository to the implementation.
