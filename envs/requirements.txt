@@ -1,0 +1,8 @@
+# EpitopeScope - core dependencies (python -m venv)
+#
+#   python3 -m venv .venv && . .venv/bin/activate
+#   pip install -r envs/requirements.txt
+#
+# This is enough to run:  epitopescope.py -d antigens/ --embed none
+numpy>=1.21
+scipy>=1.9

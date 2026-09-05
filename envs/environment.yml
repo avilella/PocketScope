@@ -1,0 +1,22 @@
+# EpitopeScope - conda environment.
+#
+#   conda env create -f envs/environment.yml
+#   conda activate epitopescope
+#
+# This installs the CPU torch build. For a CUDA machine, replace the `pytorch` line with the
+# command from https://pytorch.org/get-started/locally/ after creating the environment, e.g.
+#   conda activate epitopescope
+#   pip install --force-reinstall torch --index-url https://download.pytorch.org/whl/cu124
+name: epitopescope
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy>=1.21
+  - scipy>=1.9
+  - pip
+  - pip:
+      - torch>=2.0
+      - transformers>=4.40
+      # --embed esmc and --index only; drop this line if you do not need the PocketScope index
+      - esm>=3.0

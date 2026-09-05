@@ -1,0 +1,19 @@
+# EpitopeScope - protein language model backends.
+#
+# Install AFTER envs/requirements.txt. Pick the torch build that matches your machine first,
+# because pip's default torch wheel is CUDA-flavoured and large:
+#
+#   CPU only:   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   CUDA 12.x:  pip install torch --index-url https://download.pytorch.org/whl/cu124
+#
+# then:
+#   pip install -r envs/requirements-plm.txt
+#
+# --embed esm2 (default when available): ESM-2 650M through transformers. ~2.5 GB download,
+#                                        cached in ~/.cache/huggingface.
+# --embed esmc:                          ESM-C 600M, the exact model PocketScope uses, and the
+#                                        only backend whose 1165-d features match the prebuilt
+#                                        pocketome index used by --index.
+torch>=2.0
+transformers>=4.40
+esm>=3.0
