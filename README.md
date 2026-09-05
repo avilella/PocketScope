@@ -96,7 +96,7 @@ for hit in ix.search(query, top_k=10):
 `epitopescope.py` is a separate tool built on this representation. Given a folder of antigen
 PDB files it ranks the surface epitopes worth targeting with in-silico designed nanobodies, so
 that the panel has minimal cross-talk between antigens and each epitope sits in a fragment an
-E. coli PURE IVTT reaction can actually make and fold. See
+in-vitro transcription and translation (IVTT) reaction can actually make and fold. See
 [README.epitopescope.md](README.epitopescope.md).
 
 ```bash
