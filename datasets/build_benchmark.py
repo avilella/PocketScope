@@ -168,7 +168,7 @@ def main() -> int:
                     help="skip this many accepted complexes first, to build a disjoint set")
     ap.add_argument("--search-rows", type=int, default=150)
     ap.add_argument("--max-resolution", type=float, default=2.6)
-    ap.add_argument("--contact", type=float, default=4.5,
+    ap.add_argument("--contact", type=float, default=4.0,
                     help="heavy-atom distance defining an observed epitope contact")
     ap.add_argument("--min-epitope", type=int, default=8)
     ap.add_argument("--min-residues", type=int, default=60)
