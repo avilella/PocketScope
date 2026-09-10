@@ -22,6 +22,7 @@ import argparse
 import csv
 import math
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -52,6 +53,25 @@ def jaccard(a, b):
     return len(a & b) / len(a | b) if (a or b) else 0.0
 
 
+BOOTSTRAP_REPLICATES = 2_000
+BOOTSTRAP_SEED = 0
+
+
+def binomial_ci(hits: int, n: int, replicates: int = BOOTSTRAP_REPLICATES,
+                seed: int = BOOTSTRAP_SEED):
+    """Deterministic 95 % percentile interval for a proportion.
+
+    n is 30 here, so a bare point estimate is misleading: recall@1 of 23 % carries an
+    interval roughly twice its own width. Seeded so the reported bounds are reproducible,
+    following the same convention as Odin-Multi's summary figures.
+    """
+    if n <= 0:
+        return (float("nan"), float("nan"))
+    rng = np.random.default_rng(seed)
+    draws = rng.binomial(n, hits / n, size=replicates) / n
+    return float(np.percentile(draws, 2.5)), float(np.percentile(draws, 97.5))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -66,11 +86,17 @@ def main() -> int:
                     help="fraction of true epitope residues a candidate must recover to count")
     ap.add_argument("--refresh", action="store_true")
     ap.add_argument("--skip-run", action="store_true", help="score existing CSVs only")
+    ap.add_argument("--script", default=None,
+                    help="path to the epitopescope build to test; defaults to the one beside "
+                         "this script. Use it to A/B two versions against the same truth")
     ap.add_argument("--rank-by", default="rank",
                     help="column to rank candidates by; 'rank' uses the tool's own order")
     ap.add_argument("--descending", action="store_true",
                     help="with --rank-by, treat a larger value as better")
     ap.add_argument("--quiet", action="store_true", help="summary only")
+    ap.add_argument("--extra-args", default="",
+                    help="extra flags passed through to epitopescope, e.g. "
+                         "\"--specificity-ratio 0\"")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
 
@@ -80,9 +106,11 @@ def main() -> int:
     log(f"{len(truth)} reference complexes in {indir}")
 
     if not a.skip_run:
-        cmd = [sys.executable, str(HERE / "epitopescope.py"), "-d", str(indir),
+        cmd = [sys.executable, a.script or str(HERE / "epitopescope.py"), "-d", str(indir),
                "--outdir", str(outdir), "--tag", a.tag, "--embed", a.embed,
                "--device", a.device, "--max-patches", str(a.max_patches), "--no-panel"]
+        if a.extra_args:
+            cmd += shlex.split(a.extra_args)
         if a.refresh:
             cmd.append("--refresh")
         log("running: " + " ".join(cmd))
@@ -98,7 +126,8 @@ def main() -> int:
         if not csv_path.exists():
             log(f"  ! no output for {key}")
             continue
-        cands = list(csv.DictReader(csv_path.open()))
+        cands = [c for c in csv.DictReader(csv_path.open())
+                 if str(c.get("rank", "")).strip() != ""]
         if not cands:
             continue
         if a.rank_by != "rank":
@@ -149,14 +178,18 @@ def main() -> int:
 
     print()
     print(f"complexes scored                 {n}")
-    print(f"detection (true epitope proposed) {len(det)}/{n} = {100*len(det)/n:.0f} %")
+    dlo, dhi = binomial_ci(len(det), n)
+    print(f"detection (true epitope proposed) {len(det)}/{n} = {100*len(det)/n:.0f} % "
+          f"[95% CI {100*dlo:.0f}-{100*dhi:.0f}]")
     for topn in (1, 3, 5):
         hit = sum(1 for r in det if r["first_hit_rank"] <= topn)
         exp = np.mean([1.0 - math.comb(max(r["n_candidates"] - r["n_hits"], 0), topn)
                        / math.comb(r["n_candidates"], topn)
                        if r["n_candidates"] >= topn else 1.0 for r in det]) if det else 0.0
         ef = (hit / len(det)) / exp if det and exp > 0 else float("nan")
-        print(f"recall@{topn}  {hit}/{n} = {100*hit/n:>3.0f} %   "
+        lo, hi = binomial_ci(hit, n)
+        print(f"recall@{topn}  {hit}/{n} = {100*hit/n:>3.0f} % "
+              f"[95% CI {100*lo:.0f}-{100*hi:.0f}]   "
               f"(random expectation {100*exp:.0f} %, enrichment factor {ef:.2f}x)")
     if det:
         ranks = [r["first_hit_rank"] for r in det]
