@@ -51,7 +51,7 @@ except Exception as exc:                                              # pragma: 
         f"(import failed: {exc}). Run it from a checkout of PocketScope, or `pip install -e .`."
     )
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # ---------------------------------------------------------------------------------------------
 # Constants
@@ -588,6 +588,11 @@ class Patch:
     cluster_size: int = 0
     cluster_antigens: int = 0
     pcs: tuple = (0.0, 0.0, 0.0)
+    # specificity, status and provenance
+    spec_ratio: float = 0.0
+    status: str = "ranked"
+    redundant_with: str = ""
+    offtarget_contexts: str = ""
 
 
 def _bell(x: float, lo: float, opt_lo: float, opt_hi: float, hi: float) -> float:
@@ -764,21 +769,36 @@ def enumerate_patches(st: Structure, args, cmap, plddt_ok: bool) -> list:
             cand.append(q)
 
     cand.sort(key=lambda p: (-p.epi_parts["prelim"], p.source != "concavity_cluster"))
-    kept = []
+    # Non-maximum suppression, but a suppressed candidate is recorded rather than dropped.
+    # Odin-Multi keeps duplicate designs in its tables with a `duplicate_sequence` status and
+    # a `duplicate_of_design_id` pointer; silently discarding them loses the audit trail of
+    # what the detector actually proposed.
+    kept, redundant = [], []
     for p in cand:
         ms = set(p.members)
-        if any(len(ms & set(q.members)) / len(ms | set(q.members)) > args.max_overlap
-               for q in kept):
+        dup = next((q for q in kept
+                    if len(ms & set(q.members)) / len(ms | set(q.members)) > args.max_overlap),
+                   None)
+        if dup is not None:
+            if len(redundant) < args.emit_redundant:
+                p.status, p._dup = "redundant", dup
+                redundant.append(p)
+            continue
+        if len(kept) >= args.max_patches:
             continue
         kept.append(p)
-        if len(kept) >= args.max_patches:
-            break
+
     for n, p in enumerate(kept, 1):
         p.pid = f"{st.path.stem}|{p.chain}|E{n:02d}"
+    for n, p in enumerate(redundant, 1):
+        p.pid = f"{st.path.stem}|{p.chain}|R{n:02d}"
+        p.redundant_with = p._dup.pid
+        del p._dup
+    for p in kept + redundant:
         X = np.stack([st.residues[i].cb for i in p.members])
         p.centre = X.mean(0)
         p.box = float(2.0 * np.abs(X - p.centre).max() + 6.0)
-    return kept
+    return kept + redundant
 
 
 def _measure_patch(p: Patch, st: Structure, cb_all, centre_all, rg, density, plddt_ok,
@@ -1375,12 +1395,23 @@ def _stack_patches(patches: list):
     return T, W, M
 
 
-def crosstalk_matrix(patches: list, chunk: int = 48) -> np.ndarray:
-    """All-pairs symmetric weighted MaxSim, batched.
+def crosstalk_matrix(patches: list, chunk: int = 48, direction: str = "max") -> np.ndarray:
+    """All-pairs weighted MaxSim, batched.
 
     The pairwise Python loop is fine for a handful of antigens and hopeless for a 96-well
     panel: 96 antigens give ~1150 patches and 660k pairs. Padding the patches into one tensor
     turns the whole matrix into a few large einsums instead.
+
+    MaxSim is asymmetric, so the two directions must be combined. `direction`:
+
+      max   (default) the pessimistic corner. Cross-talk is a risk, and a paratope raised on
+            either patch could pick up the other, so the larger of the two readings is the
+            one that matters. Odin-Multi applies the same discipline throughout, aggregating
+            contexts as min(on-target) against max(off-target) and taking iPSAE as the min of
+            its two directional scores.
+      mean  the symmetric average used before v0.3.0. Softer, and it can hide a strongly
+            one-directional resemblance.
+      min   the optimistic corner. Only useful for diagnostics.
     """
     T, W, M = _stack_patches(patches)
     n = len(patches)
@@ -1395,11 +1426,15 @@ def crosstalk_matrix(patches: list, chunk: int = 48) -> np.ndarray:
         wq = np.where(M[s0:e0], W[s0:e0], 0.0)[:, None, :]
         mx = np.where(np.isfinite(mx), mx, 0.0)
         S[s0:e0] = (mx * wq).sum(2) / denom[s0:e0, None]
-    S = 0.5 * (S + S.T)
-    return S
+    if direction == "mean":
+        return 0.5 * (S + S.T)
+    if direction == "min":
+        return np.minimum(S, S.T)
+    return np.maximum(S, S.T)
 
 
-def crosstalk(patches: list, verbose: bool = False) -> np.ndarray:
+def crosstalk(patches: list, verbose: bool = False, direction: str = "max",
+              top_partners: int = 3) -> np.ndarray:
     """Fill xt_* on every patch and return the full patch-by-patch similarity matrix.
 
     `crosstalk_max` is the raw similarity to the best-matching patch on a DIFFERENT antigen.
@@ -1410,7 +1445,7 @@ def crosstalk(patches: list, verbose: bool = False) -> np.ndarray:
     cross-antigen patch pairs.
     """
     n = len(patches)
-    S = crosstalk_matrix(patches)
+    S = crosstalk_matrix(patches, direction=direction)
     np.fill_diagonal(S, -np.inf)
     if n < 2:
         for p in patches:
@@ -1444,13 +1479,63 @@ def crosstalk(patches: list, verbose: bool = False) -> np.ndarray:
         for p in patches:
             p.xt_pct, p.s_ortho = 0.0, 1.0
         return S
+    # Odin-Multi qualifies a design on an absolute specificity ratio rather than on its rank
+    # among the other designs (summary.py: min(off-target i_pae) / max(target i_pae) >= 1.5).
+    # The analogue in similarity space is a margin ratio: how far this epitope's nearest
+    # look-alike sits, in units of how far a TYPICAL epitope's nearest look-alike sits.
+    #
+    # The reference has to be the median of the per-patch maxima, not the median of all
+    # pairs. crosstalk_max is a maximum over every patch on every other antigen, so it always
+    # sits far out in the pairwise distribution; dividing by the pairwise median would put
+    # almost everything below 1.0 by construction and say nothing. Comparing like with like --
+    # one order statistic against the same order statistic -- makes the ratio mean what it
+    # claims: above 1.0, this epitope's worst look-alike is further away than usual.
+    for i, p in enumerate(patches):
+        # the k most similar DISTINCT other antigens, for off-target counter-selection
+        row = np.where(other[i], S[i], -np.inf)
+        seen, ctx = set(), []
+        for j in np.argsort(-row):
+            if not np.isfinite(row[j]):
+                break
+            ag = patches[int(j)].antigen
+            if ag in seen or ag == p.antigen:
+                continue
+            seen.add(ag)
+            ctx.append(f"{ag}:{row[int(j)]:.4f}")
+            if len(ctx) >= top_partners:
+                break
+        p.offtarget_contexts = ";".join(ctx)
+
     m = np.array([p.xt_max for p in patches], np.float64)
+    ref = 1.0 - float(np.median(m[np.isfinite(m)])) if np.isfinite(m).any() else 0.0
+    for p in patches:
+        p.spec_ratio = round(float((1.0 - p.xt_max) / ref), 4) if ref > 1e-9 else 1.0
+
     rank = np.empty(n, np.float64)
     rank[np.argsort(m, kind="stable")] = np.arange(n)
     for i, p in enumerate(patches):
         p.xt_pct = round(float(rank[i] / max(n - 1, 1)), 4)
         p.s_ortho = float(1.0 - p.xt_pct)
     return S
+
+
+def assign_status(patches: list, args, verbose: bool = False) -> dict:
+    """Label every candidate with an explicit status instead of silently ranking all of them.
+
+    Odin-Multi records why a design did not become a candidate (`incomplete_contexts`,
+    `below_specificity_ratio`, `duplicate_sequence`, ...) rather than dropping it. The same
+    vocabulary here: `redundant` is already set by the site enumerator, and everything else
+    is gated on the absolute specificity ratio.
+    """
+    counts: dict = {}
+    for p in patches:
+        if p.status != "redundant":
+            p.status = ("ranked" if p.spec_ratio >= args.specificity_ratio
+                        else "below_specificity_ratio")
+        counts[p.status] = counts.get(p.status, 0) + 1
+    vlog("candidate status: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())),
+         verbose)
+    return counts
 
 
 def select_panel(patches: list, S: np.ndarray, args, verbose: bool = False):
@@ -1464,7 +1549,8 @@ def select_panel(patches: list, S: np.ndarray, args, verbose: bool = False):
     idx_of = {id(p): i for i, p in enumerate(patches)}
     by_ag: dict = {}
     for p in patches:
-        by_ag.setdefault(p.antigen, []).append(p)
+        if p.status == "ranked":
+            by_ag.setdefault(p.antigen, []).append(p)
     if len(by_ag) < 2:
         for ps in by_ag.values():
             best = max(ps, key=lambda p: _geomean([p.s_epitope, p.s_pure]))
@@ -1547,7 +1633,22 @@ def select_panel(patches: list, S: np.ndarray, args, verbose: bool = False):
     for a in ags:
         p = best_sel[a]
         log(f"    {p.pid:<26} epitope={p.s_epitope:.2f} pure={p.s_pure:.2f} "
-            f"worst-vs-panel={p.panel_worst:.4f} vs {p.panel_worst_partner}")
+            f"spec={p.spec_ratio:.2f} worst-vs-panel={p.panel_worst:.4f} "
+            f"vs {p.panel_worst_partner}")
+    weak = [a for a in ags if best_sel[a].spec_ratio < args.specificity_ratio]
+    missing = sorted({p.antigen for p in patches} - set(ags))
+    if weak or missing:
+        log(f"panel verdict: NOT SEPARABLE at specificity ratio "
+            f"{args.specificity_ratio:g}")
+        if missing:
+            log(f"    no candidate cleared the gate for: {', '.join(missing[:8])}"
+                + (" ..." if len(missing) > 8 else ""))
+        if weak:
+            log(f"    selected but under the gate: {', '.join(weak[:8])}"
+                + (" ..." if len(weak) > 8 else ""))
+    else:
+        log(f"panel verdict: separable, every member clears specificity ratio "
+            f"{args.specificity_ratio:g}")
     return worst_overall
 
 
@@ -1575,14 +1676,18 @@ def proteome_screen(patches: list, index_dir: str, device: str, top_k: int,
 FIELDS = [
     "rank", "epitope_id", "antigen", "chain", "n_epitope_residues",
     "nanobody_target_score", "epitope_score", "orthogonality_score", "pure_ivtt_score",
+    "status", "redundant_with", "specificity_ratio",
     "pure_zone", "n_pure_rules_passed", "pure_rules_all_pass", "flags",
     "site_source", "site_buriedness", "site_center_x", "site_center_y", "site_center_z",
     "site_box_A",
     "dg_est_kcal_mol", "kd_est_M", "pkd_est", "buried_area_est_A2", "apolar_index",
+    "interface_nres", "interface_dsasa_est_A2", "interface_dg_dsasa_ratio",
+    "interface_hydrophobicity",
     "epitope_le", "epitope_lle", "epitope_fq", "epitope_complexity_index",
+    "target_residues", "target_hotspot_residues", "odin_hotspots_core",
     "epitope_residues", "rfdiffusion_hotspots", "epitope_sequence",
     "crosstalk_max", "crosstalk_partner", "crosstalk_top3", "crosstalk_percentile",
-    "crosstalk_within_antigen", "crosstalk_z",
+    "crosstalk_within_antigen", "crosstalk_z", "offtarget_contexts",
     "panel_selected", "panel_worst_crosstalk", "panel_worst_partner",
     "crosstalk_cluster", "cluster_size", "cluster_n_antigens", "pc1", "pc2", "pc3",
     "proteome_offtarget_max", "proteome_offtarget_hit",
@@ -1634,6 +1739,10 @@ def flags_for(p: Patch) -> str:
         f.append("LOW_LLE_GREASY")
     if p.fq and p.fq < 0.8:
         f.append("LOW_FIT_QUALITY")
+    if p.status == "below_specificity_ratio":
+        f.append(f"BELOW_SPECIFICITY({p.spec_ratio:.2f})")
+    if p.status == "redundant":
+        f.append(f"REDUNDANT_WITH({p.redundant_with})")
     return ";".join(f) or "-"
 
 
@@ -1650,6 +1759,9 @@ def row_for(p: Patch, st: Structure, rank: int, surface: str = "monomer") -> dic
         "epitope_score": round(p.s_epitope, 4),
         "orthogonality_score": round(p.s_ortho, 4),
         "pure_ivtt_score": round(p.s_pure, 4),
+        "status": p.status,
+        "redundant_with": p.redundant_with,
+        "specificity_ratio": p.spec_ratio,
         "pure_zone": p.zone,
         "n_pure_rules_passed": sum(p.rules.values()),
         "pure_rules_all_pass": int(all(p.rules.values())),
@@ -1665,11 +1777,26 @@ def row_for(p: Patch, st: Structure, rank: int, surface: str = "monomer") -> dic
         "pkd_est": round(p.pkd, 3),
         "buried_area_est_A2": round(p.bsa, 1),
         "apolar_index": round(p.apolar_index, 3),
+        # Rosetta InterfaceAnalyzer vocabulary, so these join against a design pipeline's
+        # own interface table. Estimated from geometry here, not from a scored complex.
+        "interface_nres": len(p.members),
+        "interface_dsasa_est_A2": round(2.0 * p.bsa, 1),
+        "interface_dg_dsasa_ratio": round(100.0 * p.dg / max(2.0 * p.bsa, 1e-9), 4),
+        "interface_hydrophobicity": round(100.0 * p.hydrophobic_frac, 1),
         "epitope_le": round(p.le, 4),
         "epitope_lle": round(p.lle, 3),
         "epitope_fq": round(p.fq, 4),
         "epitope_complexity_index": round(p.eci, 4),
         **{f"rule_{k}_pass": int(v) for k, v in p.rules.items()},
+        "target_residues": ",".join(f"{r.chain}:{r.resseq}{r.icode.strip()}"
+                                    for r in sorted(rs, key=lambda x: (x.chain, x.resseq,
+                                                                       x.icode))),
+        "target_hotspot_residues": collapse_residues(
+            ",".join(f"{r.chain}:{r.resseq}{r.icode.strip()}"
+                     for r in sorted(rs, key=lambda x: x.resseq))),
+        "odin_hotspots_core": collapse_residues(
+            ",".join(f"{r.chain}:{r.resseq}{r.icode.strip()}"
+                     for r in sorted(top, key=lambda x: x.resseq))),
         "epitope_residues": " ".join(f"{r.aa}{r.resseq}" for r in sorted(rs, key=lambda x: x.resseq)),
         "rfdiffusion_hotspots": ",".join(f"{r.chain}{r.resseq}" for r in top),
         "epitope_sequence": "".join(r.aa for r in sorted(rs, key=lambda x: x.resseq)),
@@ -1679,6 +1806,7 @@ def row_for(p: Patch, st: Structure, rank: int, surface: str = "monomer") -> dic
         "crosstalk_percentile": p.xt_pct,
         "crosstalk_within_antigen": p.xt_self,
         "crosstalk_z": p.xt_z,
+        "offtarget_contexts": p.offtarget_contexts,
         "panel_selected": 1 if p.panel_sel else 0,
         "panel_worst_crosstalk": p.panel_worst if p.panel_sel else "",
         "panel_worst_partner": p.panel_worst_partner if p.panel_sel else "",
@@ -1721,13 +1849,192 @@ def row_for(p: Patch, st: Structure, rank: int, surface: str = "monomer") -> dic
 
 
 def write_csv(path: Path, patches: list, st: Structure, surface: str = "monomer") -> None:
+    """Ranked candidates first and numbered; everything else follows with an empty rank.
+
+    A redundant or below-threshold row must not consume a rank, or it displaces a real
+    candidate and quietly corrupts any recall@N computed downstream.
+    """
     tmp = path.with_suffix(path.suffix + ".tmp")
+    ranked = [p for p in patches if p.status == "ranked"]
+    others = [p for p in patches if p.status != "ranked"]
     with open(tmp, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=FIELDS, extrasaction="ignore")
         w.writeheader()
-        for rank, p in enumerate(patches, 1):
+        for rank, p in enumerate(ranked, 1):
             w.writerow(row_for(p, st, rank, surface))
+        for p in others:
+            w.writerow(row_for(p, st, "", surface))
     os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------------------------------------
+# Odin-Multi export
+#
+# Odin-Multi (https://github.com/DigBioLab/odin_multi) designs one shared binder sequence
+# against several fixed contexts at once, with attractive losses on targets and repulsive
+# losses on off-targets. That is the natural consumer of a panel: EpitopeScope decides which
+# epitope each nanobody should aim at and which neighbours it must avoid, and Odin-Multi turns
+# that into a design run. Only the small JSON contract is reproduced here -- none of
+# Odin-Multi's AlphaFold dependencies are needed to write it.
+# ---------------------------------------------------------------------------------------------
+
+def collapse_residues(target_residues: str) -> str:
+    """`A:42,A:43,A:44,A:57` -> `A42-44,A57`, the target_hotspot_residues syntax."""
+    by_chain: dict = {}
+    for tok in target_residues.split(","):
+        if ":" not in tok:
+            continue
+        c, n = tok.split(":", 1)
+        digits = "".join(ch for ch in n if ch.isdigit() or ch == "-")
+        if digits.lstrip("-").isdigit():
+            by_chain.setdefault(c, []).append(int(digits))
+    out = []
+    for c, nums in by_chain.items():
+        nums = sorted(set(nums))
+        i = 0
+        while i < len(nums):
+            j = i
+            while j + 1 < len(nums) and nums[j + 1] == nums[j] + 1:
+                j += 1
+            out.append(f"{c}{nums[i]}" if i == j else f"{c}{nums[i]}-{nums[j]}")
+            i = j + 1
+    return ",".join(out)
+
+
+def odin_hotspots(p: Patch, st: Structure, mode: str, n_core: int, surface: str) -> str:
+    """Hotspot string for one epitope.
+
+    `core` takes the n most exposed residues. A whole 22-residue patch as hotspots
+    over-constrains the design: the shipped Odin-Multi example uses nine, and RFdiffusion
+    practice is three to six.
+    """
+    rs = [st.residues[i] for i in p.members]
+    if mode == "core":
+        rs = sorted(rs, key=lambda r: -sasa_of(r, surface))[:max(n_core, 1)]
+    return collapse_residues(",".join(f"{r.chain}:{r.resseq}{r.icode.strip()}"
+                                      for r in sorted(rs, key=lambda x: x.resseq)))
+
+
+def _portable_path(target: Path, base: Path) -> str:
+    rel = os.path.relpath(target, base)
+    return rel if rel.count("..") <= 3 else str(target)
+
+
+def write_odin_export(outdir: Path, patches: list, structures: dict, args) -> Path:
+    """Write settings_target JSONs and the matching `odin_multi.py design` command lines."""
+    import json
+
+    outdir.mkdir(parents=True, exist_ok=True)
+    tdir = outdir / "settings_target"
+    tdir.mkdir(exist_ok=True)
+    st_of = {st.path.stem: st for st in structures.values()}
+    sel = [p for p in patches if p.panel_sel]
+    if not sel:
+        sel = [p for p in patches if p.status == "ranked"]
+    by_ag = {p.antigen: p for p in sorted(sel, key=lambda q: -q.total)}
+
+    # A JSON is needed for every antigen that appears as a target OR as somebody's
+    # off-target, otherwise a --context line points at a file that was never written.
+    needed = set(by_ag)
+    for p in by_ag.values():
+        for c in p.offtarget_contexts.split(";"):
+            if c:
+                needed.add(c.split(":")[0])
+    # An off-target context does not have to clear the specificity gate: the point is to
+    # tell the design run what surface to avoid, and an antigen with no qualifying epitope
+    # of its own is exactly the one worth avoiding. Any non-redundant site will do.
+    best_of = {}
+    for p in patches:
+        if p.status == "redundant":
+            continue
+        if p.antigen not in best_of or p.total > best_of[p.antigen].total:
+            best_of[p.antigen] = p
+
+    written, targets = [], []
+    for ag in sorted(needed):
+        st = st_of.get(ag)
+        p = by_ag.get(ag) or best_of.get(ag)
+        if st is None or p is None:
+            continue
+        cfg = {
+            "binder_name": f"nb_{ag}",
+            # relative when that stays readable, absolute otherwise; Odin-Multi accepts
+            # either, and a path with eight levels of `..` helps nobody
+            "starting_pdb": _portable_path(st.path.resolve(), tdir.resolve()),
+            "chains": ",".join(sorted(st.chains)),
+            "target_hotspot_residues": odin_hotspots(p, st, args.odin_hotspot_mode,
+                                                     args.odin_hotspot_n, args.surface),
+        }
+        f = tdir / f"{ag}.json"
+        f.write_text(json.dumps(cfg, indent=2) + "\n")
+        written.append((ag, p, f))
+        if ag in by_ag:
+            targets.append((ag, p, f))
+
+    lines = ["#!/usr/bin/env bash",
+             "# Generated by epitopescope " + __version__ + ".",
+             "# One Odin-Multi design run per antigen: the panel epitope is the target context,",
+             "# and the antigens it most resembles become off-target contexts to counter-select.",
+             "# Pair each target JSON with settings_loss/target.json or offtarget.json.",
+             "set -euo pipefail", ""]
+    have = {ag for ag, _, _ in written}
+    for ag, p, f in targets:
+        offs = [c.split(":")[0] for c in p.offtarget_contexts.split(";") if c]
+        offs = [o for o in offs if o in have and o != ag][:args.odin_offtargets]
+        lines.append(f"# {p.pid}  spec_ratio={p.spec_ratio:.2f}  "
+                     f"worst-vs-panel={p.panel_worst:.4f}")
+        cmd = ["python -u odin_multi.py design",
+               f"  --run-dir outputs/{ag}",
+               f"  --context settings_target/{ag}.json settings_loss/target.json"]
+        for o in offs:
+            cmd.append(f"  --context settings_target/{o}.json settings_loss/offtarget.json")
+        cmd += ["  --advanced settings_advanced/general.json",
+                "  --base-seed 42 --num-designs 100"]
+        lines.append(" \\\n".join(cmd))
+        lines.append("")
+    sh = outdir / "odin_design_commands.sh"
+    sh.write_text("\n".join(lines))
+    sh.chmod(0o755)
+    return outdir
+
+
+def check_environment(args) -> int:
+    """Preflight the things that silently degrade a run, in the style of Odin-Multi's
+    validate_install.py: report each check, and fail only on what actually blocks."""
+    ok = True
+    log(f"epitopescope {__version__}")
+    log(f"  python        {sys.version.split()[0]}")
+    log(f"  numpy         {np.__version__}")
+    try:
+        import scipy
+        log(f"  scipy         {scipy.__version__}")
+    except Exception:
+        log("  scipy         MISSING (slower fallbacks will be used)")
+    backend = Embedder.resolve(args.embed, True)
+    log(f"  --embed       {args.embed} -> {backend}")
+    if backend == "none":
+        log("  WARNING       no protein language model; cross-talk will be weak")
+    for mod in {"esm2": ["torch", "transformers"], "esmc": ["torch", "esm"]}.get(backend, []):
+        try:
+            m = __import__(mod)
+            log(f"  {mod:<13} {getattr(m, '__version__', 'ok')}")
+        except Exception as exc:
+            log(f"  {mod:<13} MISSING ({exc})")
+            ok = False
+    try:
+        import torch
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                d = torch.cuda.get_device_properties(i)
+                log(f"  cuda:{i}        {d.name}, {d.total_memory / 2 ** 30:.1f} GiB")
+        else:
+            log(f"  cuda          NOT AVAILABLE. torch {torch.__version__} is built for CUDA "
+                f"{torch.version.cuda}; --device cuda will silently fall back to cpu. "
+                f"Install a torch whose CUDA version your driver supports.")
+    except Exception:
+        pass
+    log("environment OK" if ok else "environment INCOMPLETE")
+    return 0 if ok else 1
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1768,6 +2075,44 @@ METRIC_DOCS = {
    "Compact, cysteine-light, ordered, excisable, monomeric: a good PURE construct.",
    "Blocked by disulfides, glycosylation, hydrophobic segments, disorder or size.",
    "higher_is_better"),
+ "status": ("Why this row is or is not a candidate: `ranked` (a real candidate), "
+   "`redundant` (a strongly overlapping site suppressed in favour of the one named in "
+   "redundant_with, kept for the audit trail rather than discarded), or "
+   "`below_specificity_ratio` (too confusable with another antigen to qualify).",
+   "", "", ""),
+ "redundant_with": ("For a redundant row, the epitope_id it overlaps. Empty otherwise.",
+   "", "", ""),
+ "specificity_ratio": ("How far this epitope's nearest look-alike on another antigen sits, "
+   "in units of how far a typical cross-antigen pair sits. The absolute qualification rule, "
+   "in the style of Odin-Multi's min(off-target i_pae) / max(target i_pae) gate.",
+   "Much better separated from the rest of the panel than an average pair: safe to design "
+   "against.",
+   "Below 1.0 means more confusable than an average cross-antigen pair. This is the number "
+   "that can declare a whole panel unusable, which a rank-based score cannot.",
+   "higher_is_better"),
+ "target_hotspot_residues": ("The whole epitope in Odin-Multi / BindCraft hotspot syntax, "
+   "<chain><resnum> with ranges collapsed, e.g. A10,A14-18. Paste into a settings_target "
+   "JSON.", "", "", ""),
+ "odin_hotspots_core": ("The most exposed residues only, same syntax. Passing a whole "
+   "22-residue epitope as hotspots tends to over-constrain a design run; this is the "
+   "three-to-six residue core that design tools expect.", "", "", ""),
+ "offtarget_contexts": ("The most similar DISTINCT other antigens, as antigen:similarity "
+   "pairs. These are the counter-selection contexts for a multi-target design run.",
+   "", "", ""),
+ "interface_nres": ("Epitope residue count, under the Rosetta InterfaceAnalyzer name so "
+   "this table joins against a design pipeline's interface metrics.",
+   "A large interface.", "A small interface.", "context"),
+ "interface_dsasa_est_A2": ("Estimated total buried area of the interface, both sides, the "
+   "dSASA analogue. Estimated from geometry, not from a scored complex.",
+   "A large contact area is available.", "Little area to bury.", "higher_is_better"),
+ "interface_dg_dsasa_ratio": ("Estimated dG per 100 A^2 of buried area, the Rosetta "
+   "dG_dSASA_ratio analogue and the same normalisation idea as epitope_le.",
+   "Close to zero: poor energy return per unit area buried.",
+   "Strongly negative: efficient use of the interface.", "lower_is_better"),
+ "interface_hydrophobicity": ("Percentage of epitope residues with apolar side chains, the "
+   "Rosetta interface_hydrophobicity analogue.",
+   "A greasy interface: sticky and often non-specific.",
+   "A polar interface, usually more selectively recognisable.", "context"),
  "pure_zone": ("Three-colour developability call, the BOILED-Egg analogue: GREEN, YELLOW "
    "or RED from construct length, exposed hydrophobic surface and rules passed.",
    "GREEN: short, polar-surfaced and clearing at least 6 of the 7 rules. Order it.",
@@ -1824,7 +2169,13 @@ METRIC_DOCS = {
    "variety and sequence discontinuity, 0-1.",
    "A large, chemically varied, conformational epitope: distinctive but harder to mimic.",
    "A small, uniform, largely linear epitope: simple but less distinctive.", "context"),
- "epitope_residues": ("Epitope residues as <aa><resseq>, in sequence order.", "", "", ""),
+ "target_residues": ("The epitope as chain-qualified residue coordinates, "
+   "<chain>:<resseq>[<icode>] separated by commas and ordered by residue number, e.g. "
+   "A:42,A:43,A:44. This is the unambiguous machine-readable identifier for the site: unlike "
+   "epitope_residues it names the chain, so it stays correct for multi-chain inputs and can "
+   "be pasted straight into a selection or design specification.", "", "", ""),
+ "epitope_residues": ("Epitope residues as <aa><resseq>, in sequence order. Convenient to "
+   "read; use target_residues when the chain matters.", "", "", ""),
  "rfdiffusion_hotspots": ("Five most exposed epitope residues, formatted for the RFdiffusion "
    "ppi.hotspot_res argument.", "", "", ""),
  "epitope_sequence": ("One-letter sequence of the epitope residues in sequence order.",
@@ -2062,6 +2413,7 @@ def write_metric_yaml(path: Path, args, n_antigens: int, n_epitopes: int,
             "site_source", "pure_zone", "flags", "epitope_id", "antigen", "chain",
             "crosstalk_partner", "panel_worst_partner", "proteome_offtarget_hit",
             "construct_range", "construct_sequence", "epitope_residues",
+            "target_residues",
             "epitope_sequence", "rfdiffusion_hotspots", "cofactor_contact")
         lines.append(f"  - name: {name}")
         lines.append(f"    description: {_yaml_quote(desc)}")
@@ -2135,7 +2487,11 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--max-overlap", type=float, default=0.40,
                    help="Jaccard overlap above which two patches are treated as redundant")
     g.add_argument("--max-patches", type=int, default=12,
-                   help="candidate epitopes kept per antigen")
+                   help="ranked candidate epitopes kept per antigen")
+    g.add_argument("--emit-redundant", type=int, default=6,
+                   help="also emit up to this many suppressed overlapping candidates per "
+                        "antigen, labelled status=redundant with a redundant_with pointer; "
+                        "0 discards them as before v0.3.0")
     g.add_argument("--probe", type=float, default=1.4, help="SASA probe radius")
     g.add_argument("--sasa-points", type=int, default=92, help="Shrake-Rupley sphere points")
     g.add_argument("--contact-cutoff", type=float, default=5.0,
@@ -2173,6 +2529,19 @@ def build_parser() -> argparse.ArgumentParser:
                    help="largest antigen-side area, in angstrom^2, a VHH paratope can bury")
     g.add_argument("--dg-flex", type=float, default=2.0,
                    help="free-energy penalty, kcal/mol, for a fully flexible epitope")
+    g.add_argument("--crosstalk-direction", choices=["max", "mean", "min"], default="max",
+                   help="how to combine the two asymmetric MaxSim readings of a patch pair. "
+                        "max is the conservative corner and the default from v0.3.0; mean "
+                        "reproduces the earlier symmetric average")
+    g.add_argument("--specificity-ratio", type=float, default=0.8,
+                   help="minimum margin ratio for a candidate to be status=ranked: how far "
+                        "its nearest look-alike sits, in units of how far a typical "
+                        "epitope's nearest look-alike sits. 1.0 is exactly typical by "
+                        "construction, so the default 0.8 rejects only the clearly "
+                        "worse-than-average sites. Raise it for a stricter panel; set 0 to "
+                        "report without gating")
+    g.add_argument("--top-partners", type=int, default=3,
+                   help="distinct off-target antigens recorded per epitope")
     g.add_argument("--cluster-cut", default="auto",
                    help="cross-talk similarity joining two epitopes into one cluster; "
                         "'auto' uses the 95th percentile of this run's cross-antigen "
@@ -2197,6 +2566,21 @@ def build_parser() -> argparse.ArgumentParser:
                    help="how much panel quality is traded against worst-case cross-talk")
     g.add_argument("--panel-restarts", type=int, default=24,
                    help="random restarts for the panel optimiser")
+    g = p.add_argument_group("Odin-Multi export")
+    g.add_argument("--emit-odin", default=None, metavar="DIR",
+                   help="write Odin-Multi settings_target JSONs and design command lines for "
+                        "the selected panel into DIR")
+    g.add_argument("--odin-hotspot-mode", choices=["core", "full"], default="core",
+                   help="hotspots per target: the most exposed --odin-hotspot-n residues, or "
+                        "the whole epitope (which tends to over-constrain the design)")
+    g.add_argument("--odin-hotspot-n", type=int, default=6,
+                   help="core hotspot count")
+    g.add_argument("--odin-offtargets", type=int, default=2,
+                   help="off-target contexts per design run")
+
+    p.add_argument("--check-env", action="store_true",
+                   help="report the environment and exit, including whether torch can "
+                        "actually see the GPU")
     p.add_argument("--no-yaml", action="store_true",
                    help="do not write the epitopescope.<tag>.yaml metric dictionary")
     p.add_argument("--version", action="version", version=f"epitopescope {__version__}")
@@ -2204,7 +2588,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    if argv is None:
+        argv = sys.argv[1:]
+    if "--check-env" in argv and not any(a in ("-d", "--inputdir") for a in argv):
+        argv = list(argv) + ["-d", "."]
+    args = parser.parse_args(argv)
+    if args.check_env:
+        return check_environment(args)
     v = args.verbose
 
     indir = Path(args.inputdir).expanduser().resolve()
@@ -2289,10 +2680,11 @@ def main(argv=None) -> int:
 
     vlog(f"cross-talk: {len(all_patches)} patches over "
          f"{len({p.antigen for p in all_patches})} antigens", v)
-    S = crosstalk(all_patches, v)
+    S = crosstalk(all_patches, v, args.crosstalk_direction, args.top_partners)
 
     baseline = fit_efficiency_baseline(all_patches, v)
     apply_fit_quality(all_patches, baseline)
+    assign_status(all_patches, args, v)
     cut = resolve_cluster_cut(all_patches, S, args.cluster_cut)
     cluster_epitopes(all_patches, S, cut, v)
     pca_epitopes(all_patches, v)
@@ -2331,6 +2723,12 @@ def main(argv=None) -> int:
                  f"(epitope {b.s_epitope:.2f} / ortho {b.s_ortho:.2f} / pure {b.s_pure:.2f}) "
                  f"construct {b.con_range} {len(b.con_seq)} aa", v)
         written.append(out_of[q])
+
+    if args.emit_odin:
+        od = write_odin_export(Path(args.emit_odin).expanduser().resolve(),
+                               all_patches, structures, args)
+        vlog(f"Odin-Multi export written to {od}", v)
+        written.append((od / "odin_design_commands.sh").resolve())
 
     if not args.no_yaml:
         ypath = (outdir or inputs[0].parent) / f"epitopescope.{args.tag}.yaml"
