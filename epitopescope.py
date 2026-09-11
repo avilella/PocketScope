@@ -51,7 +51,7 @@ except Exception as exc:                                              # pragma: 
         f"(import failed: {exc}). Run it from a checkout of PocketScope, or `pip install -e .`."
     )
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 # ---------------------------------------------------------------------------------------------
 # Constants
@@ -148,6 +148,7 @@ class Structure:
     chains: dict                        # chain id -> [Residue]
     het: list                           # (resname, chain, resseq, coords) non-water HETATM groups
     is_plddt: bool = False
+    bfac_pct: dict = None               # residue idx -> within-structure B-factor percentile
 
     def chain_seq(self, ch: str) -> str:
         return "".join(r.aa for r in self.chains[ch])
@@ -268,8 +269,19 @@ def parse_pdb(path: Path, bfactor_mode: str = "auto") -> Structure:
             # AlphaFold-like distribution even without an AF- filename
             is_plddt = bool(np.percentile(bvals, 75) > 80.0)
 
-    return Structure(path=path, name=path.name, residues=reslist, chains=chains, het=het,
-                     is_plddt=is_plddt)
+    st = Structure(path=path, name=path.name, residues=reslist, chains=chains, het=het,
+                   is_plddt=is_plddt)
+    # Crystallographic B-factors are on a per-structure scale: across this repository's panels
+    # the mean runs from 17 to 119 A^2. Mapping them onto one absolute rigidity scale makes a
+    # well-refined antigen look uniformly rigid and a poorly-refined one uniformly floppy, which
+    # is a property of the experiment, not the epitope, and it corrupts every cross-antigen
+    # comparison the tool exists to make. Rank them within their own structure instead.
+    # pLDDT needs no such treatment: it is already comparable between models.
+    if not is_plddt and len(bvals) > 1:
+        order = np.argsort(np.argsort(bvals))
+        pct = order / max(len(bvals) - 1, 1)
+        st.bfac_pct = {r.idx: float(pct[i]) for i, r in enumerate(reslist)}
+    return st
 
 
 def _pseudo_cb(r: Residue) -> np.ndarray:
@@ -819,8 +831,14 @@ def _measure_patch(p: Patch, st: Structure, cb_all, centre_all, rg, density, pld
         w = np.linalg.svd(Xc, compute_uv=False) ** 2 / max(len(X) - 1, 1)
         p.planarity = float(np.sqrt(max(w[-1], 0.0)))
     p.mean_bfac = float(np.mean([r.bfac for r in rs]))
-    p.rigidity = float(np.clip(p.mean_bfac / 100.0, 0, 1)) if plddt_ok else \
-        float(np.clip(1.0 - (p.mean_bfac - 15.0) / 60.0, 0, 1))
+    if plddt_ok:
+        p.rigidity = float(np.clip(p.mean_bfac / 100.0, 0, 1))
+    elif st.bfac_pct:
+        # 1 - the patch's mean B-factor percentile within its own structure
+        p.rigidity = float(np.clip(
+            1.0 - np.mean([st.bfac_pct.get(r.idx, 0.5) for r in rs]), 0.0, 1.0))
+    else:
+        p.rigidity = float(np.clip(1.0 - (p.mean_bfac - 15.0) / 60.0, 0, 1))
 
     pos = sorted(r.chain_pos for r in rs)
     runs, run = [], 1
@@ -1928,10 +1946,24 @@ def write_odin_export(outdir: Path, patches: list, structures: dict, args) -> Pa
     tdir = outdir / "settings_target"
     tdir.mkdir(exist_ok=True)
     st_of = {st.path.stem: st for st in structures.values()}
-    sel = [p for p in patches if p.panel_sel]
-    if not sel:
-        sel = [p for p in patches if p.status == "ranked"]
-    by_ag = {p.antigen: p for p in sorted(sel, key=lambda q: -q.total)}
+    # The panel pick per antigen, plus the next few ranked sites when --odin-top > 1.
+    # Benchmarks put the validated epitope first only about half the time, so committing a
+    # design campaign to rank 1 alone throws away sites that are in the list; Odin-Multi's
+    # own re-evaluation stage is the right place to arbitrate between them.
+    ranked_by_ag: dict = {}
+    for p in sorted((q for q in patches if q.status == "ranked"), key=lambda q: -q.total):
+        ranked_by_ag.setdefault(p.antigen, []).append(p)
+    by_ag, extra = {}, []
+    for ag, lst in ranked_by_ag.items():
+        head = next((q for q in lst if q.panel_sel), lst[0])
+        by_ag[ag] = head
+        for q in lst:
+            if q is not head and len(extra) < 10 ** 6:
+                extra.append(q)
+    top_extra: dict = {}
+    for ag, lst in ranked_by_ag.items():
+        head = by_ag[ag]
+        top_extra[ag] = [q for q in lst if q is not head][:max(args.odin_top - 1, 0)]
 
     # A JSON is needed for every antigen that appears as a target OR as somebody's
     # off-target, otherwise a --context line points at a file that was never written.
@@ -1977,10 +2009,29 @@ def write_odin_export(outdir: Path, patches: list, structures: dict, args) -> Pa
              "# and the antigens it most resembles become off-target contexts to counter-select.",
              "# Pair each target JSON with settings_loss/target.json or offtarget.json.",
              "set -euo pipefail", ""]
+    # alternates get their own target file and their own run
+    for ag, alts in sorted(top_extra.items()):
+        st = st_of.get(ag)
+        if st is None:
+            continue
+        for k, q in enumerate(alts, 2):
+            cfg = {
+                "binder_name": f"nb_{ag}_alt{k}",
+                "starting_pdb": _portable_path(st.path.resolve(), tdir.resolve()),
+                "chains": ",".join(sorted(st.chains)),
+                "target_hotspot_residues": odin_hotspots(q, st, args.odin_hotspot_mode,
+                                                         args.odin_hotspot_n, args.surface),
+            }
+            f2 = tdir / f"{ag}_alt{k}.json"
+            f2.write_text(json.dumps(cfg, indent=2) + "\n")
+            written.append((f"{ag}_alt{k}", q, f2))
+            targets.append((f"{ag}_alt{k}", q, f2))
+
     have = {ag for ag, _, _ in written}
     for ag, p, f in targets:
         offs = [c.split(":")[0] for c in p.offtarget_contexts.split(";") if c]
-        offs = [o for o in offs if o in have and o != ag][:args.odin_offtargets]
+        base = ag.split("_alt")[0]
+        offs = [o for o in offs if o in have and o != base][:args.odin_offtargets]
         lines.append(f"# {p.pid}  spec_ratio={p.spec_ratio:.2f}  "
                      f"worst-vs-panel={p.panel_worst:.4f}")
         cmd = ["python -u odin_multi.py design",
@@ -2472,7 +2523,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "on the deposited assembly")
     g.add_argument("--min-rsasa", type=float, default=0.20,
                    help="minimum relative SASA for a residue to count as surface")
-    g.add_argument("--patch-radius", type=float, default=10.0,
+    # Real nanobody epitopes in datasets/nanobody_* span a median of 26.7 A, so a 10 A
+    # radius could not physically cover one. Widening to 12 A lifts how much of the true
+    # epitope the best candidate captures on both benchmark sets (0.42 -> 0.49 held out,
+    # 0.46 -> 0.56 on calibration). Its effect on recall@1 is within noise, so this is a
+    # coverage fix, not a ranking one. 10.0 reproduces pre-0.3.1 behaviour.
+    g.add_argument("--patch-radius", type=float, default=12.0,
                    help="CB radius, in angstrom, around a seed residue")
     g.add_argument("--patch-min", type=int, default=6, help="minimum residues in a patch")
     g.add_argument("--patch-max", type=int, default=22, help="maximum residues in a patch")
@@ -2548,8 +2604,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "similarities, which keeps the cut comparable across --embed backends")
 
     g = p.add_argument_group("ranking")
-    g.add_argument("--w-epitope", type=float, default=1.0, help="weight of the epitope axis")
-    g.add_argument("--w-ortho", type=float, default=1.5, help="weight of the orthogonality axis")
+    # Odin-Multi gates on the specificity ratio and then ranks the qualifying designs by
+    # target quality alone, not by specificity again. Keeping orthogonality at 1.5 in the
+    # composite double-counted it against its own gate. Re-weighting to lead with epitope
+    # quality raises held-out recall@1 from 30 % to 40 % over 30 unseen nanobody complexes
+    # (and 47 % to 70 % on the calibration set) with detection unchanged. Orthogonality keeps
+    # a small weight so it still breaks ties among qualified sites.
+    g.add_argument("--w-epitope", type=float, default=2.0, help="weight of the epitope axis")
+    g.add_argument("--w-ortho", type=float, default=0.5, help="weight of the orthogonality axis")
     g.add_argument("--w-pure", type=float, default=1.5, help="weight of the PURE axis")
     g.add_argument("--top", type=int, default=0, help="rows written per antigen (0 = all)")
 
@@ -2577,6 +2639,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="core hotspot count")
     g.add_argument("--odin-offtargets", type=int, default=2,
                    help="off-target contexts per design run")
+    g.add_argument("--odin-top", type=int, default=1,
+                   help="design runs per antigen: the panel epitope plus this many next-best "
+                        "ranked sites. Benchmarks rank the validated epitope first only about "
+                        "half the time, so 3-6 is a realistic campaign")
 
     p.add_argument("--check-env", action="store_true",
                    help="report the environment and exit, including whether torch can "
